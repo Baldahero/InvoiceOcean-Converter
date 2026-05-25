@@ -98,34 +98,3 @@ def build_row(
         "",
         "",
         "",
-        "",
-        description,
-        1.0,
-        amount,
-        amount,
-        "disabled",
-        0.0,
-        amount,
-        amount,
-        "",
-        "pc",
-        "",
-    ]
-
-
-def generate_csv(rows: list[list], headers: list[str] | None = None) -> bytes:
-    output = io.StringIO()
-    writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
-    writer.writerow(headers or INVOICEOCEAN_HEADERS)
-    for row in rows:
-        writer.writerow(row)
-    return ("\ufeff" + output.getvalue()).encode("utf-8")
-
-
-def format_date(value: datetime) -> str:
-    return value.strftime("%Y-%m-%d")
-
-
-def add_days(date_str: str, days: int) -> str:
-    value = datetime.strptime(date_str, "%Y-%m-%d")
-    return format_date(value + timedelta(days=days))
