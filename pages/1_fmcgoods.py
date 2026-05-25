@@ -197,3 +197,4 @@ if st.button("Generate CSV", type="primary", use_container_width=True):
         "VAT amount", "Total net", "Total gross",
         "Position kind", "Quantity unit", "Additional information field",
     ]
+
