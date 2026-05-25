@@ -140,6 +140,7 @@ for row_index, transaction in enumerate(transactions, start=1):
             "Product / Service": transaction.title[:200],
             "Qty": 1.0,
             "Quantity unit": "pc",
+            "Source counterparty": transaction.counterparty_name,
         }
     )
 
@@ -150,6 +151,9 @@ col1, col2, col3 = st.columns(3)
 col1.metric("Incoming", f"+{sum(tx.amount for tx in transactions if tx.amount > 0):,.2f}")
 col2.metric("Outgoing", f"{sum(tx.amount for tx in transactions if tx.amount < 0):,.2f}")
 col3.metric("Rows", len(transactions))
+
+st.subheader("Edit rows before export")
+st.caption("You can edit any field here and delete rows directly in the table.")
 
 edited_frame = st.data_editor(
     frame,
@@ -187,78 +191,9 @@ if st.button("Generate CSV for InvoiceOcean", type="primary", use_container_widt
     ]
 
     output_rows = []
-    for _, row in edited_frame.iterrows():
-        client = clients.get(str(row.get("Buyer", "")), {})
-        amount = float(row.get("Total gross price", 0) or 0)
-        amount_eur = float(row.get("Total gross price EUR", 0) or 0)
-        output_rows.append(
-            [
-                int(row.get("No.", 0)),
-                str(row.get("No. (invoice)", "")),
-                str(row.get("Kind", "Invoice")),
-                str(row.get("Seller", "")),
-                str(row.get("Department short name", "")),
-                str(row.get("Seller's TAX ID", "")),
-                str(row.get("Status", "Issued")),
-                str(row.get("Issue date", "")),
-                str(row.get("Sale date", "")),
-                str(row.get("Due date", "")),
-                str(row.get("Buyer", "")),
-                str(row.get("VAT ID", "") or client.get("vat_id", "")),
-                str(row.get("Street", "") or client.get("street", "")),
-                str(row.get("Postcode", "") or client.get("postcode", "")),
-                str(row.get("City", "") or client.get("city", "")),
-                str(row.get("Country", "") or client.get("country", "")),
-                str(row.get("Client e-mail", "") or client.get("email", "")),
-                str(row.get("Client's phone", "") or client.get("phone", "")),
-                "",
-                amount,
-                0.0,
-                amount,
-                amount_eur,
-                0.0,
-                amount_eur,
-                str(row.get("Payment type", "Transfer")),
-                str(row.get("Payment date", "")),
-                float(row.get("Paid", 0) or 0),
-                str(row.get("Currency", "PLN")),
-                str(row.get("PO number", "")),
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                str(row.get("Product / Service", "")),
-                float(row.get("Qty", 1) or 1),
-                amount,
-                amount,
-                "disabled",
-                0.0,
-                amount,
-                amount,
-                "",
-                str(row.get("Quantity unit", "pc")),
-                "",
-            ]
-        )
-
-    import csv
-    import io
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(final_columns)
-    for output_row in output_rows:
-        writer.writerow(output_row)
-
-    csv_bytes = ("\ufeff" + output.getvalue()).encode("utf-8")
-    filename = f"InvoiceOcean_TENTA_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-    st.download_button(
-        f"Download {filename}",
-        csv_bytes,
-        filename,
-        "text/csv",
-        use_container_width=True,
-    )
-    st.success(f"Prepared {len(output_rows)} CSV rows.")
+    skipped = 0
+    for output_index, (_, row) in enumerate(edited_frame.iterrows(), start=1):
+        buyer = str(row.get("Buyer", "")).strip()
+        if not buyer:
+            skipped += 1
+            continue
