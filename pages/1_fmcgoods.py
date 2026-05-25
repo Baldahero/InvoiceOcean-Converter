@@ -1,6 +1,8 @@
+import csv
+import io
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -8,8 +10,7 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from parsers.zepter_parser import parse_zepter_rtf
-from utils.clients import CLIENTS, find_best_client_match, load_clients_from_export, merge_clients
-from utils.csv_builder import add_days, build_row, generate_csv
+from utils.clients import CLIENTS, SELLERS, find_best_client_match, load_clients_from_export, merge_clients
 
 
 st.set_page_config(page_title="FMCGOODS OÜ", page_icon="🇪🇪", layout="wide")
@@ -94,91 +95,105 @@ col1.metric("Incoming", f"+{sum(tx.amount for tx in transactions if tx.amount > 
 col2.metric("Outgoing", f"{sum(tx.amount for tx in transactions if tx.amount < 0):,.2f}")
 col3.metric("Rows", len(transactions))
 
-preview_frame = pd.DataFrame(
-    [
-        {
-            "Date": transaction.date,
-            "Amount": transaction.amount,
-            "Currency": transaction.currency,
-            "Counterparty": transaction.counterparty[:50] if transaction.counterparty else "—",
-            "Tax ID": transaction.counterparty_tax_id,
-            "Description": transaction.description[:90],
-        }
-        for transaction in transactions
-    ]
-)
-st.dataframe(preview_frame, use_container_width=True, hide_index=True)
+seller = SELLERS["FMCGOODS OÜ"]
+client_list = list(clients.keys())
 
-st.subheader("Counterparty matching")
-client_names = list(clients.keys()) + ["Skip"]
-counterparties = sorted({transaction.counterparty for transaction in transactions if transaction.counterparty})
-mapping: dict[str, str] = {}
 
-for counterparty in counterparties:
-    sample_transaction = next(
-        transaction for transaction in transactions if transaction.counterparty == counterparty
-    )
-    default_client = find_best_client_match(
-        counterparty,
+def make_due(date_value: str, days: int) -> str:
+    try:
+        return (datetime.strptime(date_value, "%Y-%m-%d") + timedelta(days=days)).strftime("%Y-%m-%d")
+    except ValueError:
+        return date_value
+
+
+rows = []
+for row_index, transaction in enumerate(transactions, start=1):
+    buyer = find_best_client_match(
+        transaction.counterparty,
         clients,
-        sample_transaction.counterparty_tax_id,
+        transaction.counterparty_tax_id,
     )
-    default_index = client_names.index(default_client) if default_client in client_names else len(client_names) - 1
-    mapping[counterparty] = st.selectbox(
-        f"**{counterparty[:70]}**",
-        client_names,
-        index=default_index,
-        key=f"map_{counterparty}",
+    client = clients.get(buyer, {})
+    amount = abs(transaction.amount)
+    amount_eur = amount if transaction.currency == "EUR" else 0.0
+
+    due_date = make_due(transaction.date, due_days)
+
+    rows.append(
+        {
+            "No.": row_index,
+            "No. (invoice)": transaction.doc_num or f"ZEPT-{transaction.date.replace('-', '')}-{row_index:03d}",
+            "Kind": invoice_kind,
+            "Seller": seller["name"],
+            "Department short name": seller["name"],
+            "Seller's TAX ID": seller["tax_id"],
+            "Status": "Paid" if transaction.amount > 0 else "Issued",
+            "Issue date": transaction.date,
+            "Sale date": "",
+            "Due date": due_date,
+            "Buyer": buyer,
+            "VAT ID": client.get("vat_id", ""),
+            "Street": client.get("street", ""),
+            "Postcode": client.get("postcode", ""),
+            "City": client.get("city", ""),
+            "Country": client.get("country", ""),
+            "Client e-mail": client.get("email", ""),
+            "Client's phone": client.get("phone", ""),
+            "Mobile phone": "",
+            "Total net price": amount,
+            "TAX": 0.0,
+            "Total gross price": amount,
+            "Total net price EUR": amount_eur,
+            "TAX EUR": 0.0,
+            "Total gross price EUR": amount_eur,
+            "Payment type": "Transfer",
+            "Payment date": transaction.date if transaction.amount > 0 else "",
+            "Paid": amount if transaction.amount > 0 else 0.0,
+            "Currency": transaction.currency,
+            "PO number": transaction.doc_num,
+            "Product / Service": transaction.description[:200],
+            "Qty": 1.0,
+            "Quantity unit": "pc",
+            "Source counterparty": transaction.counterparty,
+            "Source tax ID": transaction.counterparty_tax_id,
+        }
     )
+
+frame = pd.DataFrame(rows)
+
+st.subheader("Edit rows before export")
+st.caption("You can edit any field here and delete rows directly in the table.")
+
+edited_frame = st.data_editor(
+    frame,
+    use_container_width=True,
+    num_rows="dynamic",
+    hide_index=True,
+    column_config={
+        "Buyer": st.column_config.SelectboxColumn("Buyer", options=client_list + [""]),
+        "Kind": st.column_config.SelectboxColumn("Kind", options=["Invoice", "Proforma Invoice", "Receipt"]),
+        "Status": st.column_config.SelectboxColumn(
+            "Status", options=["Paid", "Partially paid", "Issued", "Rejected"]
+        ),
+        "Currency": st.column_config.SelectboxColumn("Currency", options=["EUR", "RUB", "USD", "BYN"]),
+        "Payment type": st.column_config.SelectboxColumn("Payment type", options=["Transfer", "Cash", "Card"]),
+        "Quantity unit": st.column_config.SelectboxColumn("Quantity unit", options=["pc", "pcs", "case", "kg", "l"]),
+    },
+)
 
 st.subheader("Export CSV for InvoiceOcean")
 if st.button("Generate CSV", type="primary", use_container_width=True):
-    rows = []
-    row_num = 1
-    skipped = 0
-
-    for transaction in transactions:
-        buyer = mapping.get(transaction.counterparty, "Skip")
-        if buyer == "Skip":
-            skipped += 1
-            continue
-
-        amount_eur = abs(transaction.amount) if transaction.currency == "EUR" else 0.0
-        due_date = add_days(transaction.date, due_days)
-        rows.append(
-            build_row(
-                row_num=row_num,
-                invoice_no=transaction.doc_num or f"ZEPT-{transaction.date.replace('-', '')}-{row_num:03d}",
-                kind=invoice_kind,
-                seller_key="FMCGOODS OÜ",
-                status="Paid" if transaction.amount > 0 else "Issued",
-                issue_date=transaction.date,
-                due_date=due_date,
-                buyer_name=buyer,
-                amount=abs(transaction.amount),
-                amount_eur=amount_eur,
-                currency=transaction.currency,
-                payment_date=transaction.date if transaction.amount > 0 else "",
-                paid=abs(transaction.amount) if transaction.amount > 0 else 0.0,
-                description=transaction.description[:200],
-                po_number=transaction.doc_num,
-                clients=clients,
-            )
-        )
-        row_num += 1
-
-    if not rows:
-        st.warning("No rows were prepared for export.")
-    else:
-        csv_bytes = generate_csv(rows)
-        filename = f"InvoiceOcean_FMCGOODS_{datetime.now().strftime('%Y%m%d')}.csv"
-        st.download_button(
-            f"Download {filename}",
-            csv_bytes,
-            filename,
-            "text/csv",
-            use_container_width=True,
-        )
-        if skipped:
-            st.info(f"Skipped {skipped} transactions without a mapped client.")
-        st.success(f"Prepared {len(rows)} CSV rows.")
+    final_columns = [
+        "No.", "No.", "Kind", "Seller", "Department short name",
+        "Seller's TAX ID", "Status", "Issue date", "Sale date", "Due date",
+        "Buyer", "VAT ID", "Street", "Postcode", "City", "Country",
+        "Client e-mail", "Client's phone", "Mobile phone",
+        "Total net price", "TAX", "Total gross price",
+        "Total net price EUR", "TAX EUR", "Total gross price EUR",
+        "Payment type", "Payment date", "Paid", "Currency",
+        "PO number", "Addressee", "Category", "Notes",
+        "Additional invoice field ", "Original document", "Reason for the correction",
+        "Product / Service", "Qty", "Unit net price", "Unit gross price", "TAX",
+        "VAT amount", "Total net", "Total gross",
+        "Position kind", "Quantity unit", "Additional information field",
+    ]
