@@ -1,16 +1,15 @@
 """
 Parser for PKO Bank Polski PDF statements (TENTA TRADE SP. Z O.O.).
-Handles PLN and EUR accounts.
-Requires: pdfplumber
 """
 import re
 from dataclasses import dataclass
+import pdfplumber
+import io
 
 
 @dataclass
 class PKOTransaction:
-    date: str = ""           # YYYY-MM-DD
-    value_date: str = ""
+    date: str = ""
     op_type: str = ""
     counterparty_account: str = ""
     counterparty_name: str = ""
@@ -18,151 +17,108 @@ class PKOTransaction:
     tx_id: str = ""
     amount: float = 0.0
     currency: str = "PLN"
-    balance: float = 0.0
+
+
+def _parse_amount(s: str) -> tuple[float, str]:
+    """Returns (amount, currency)"""
+    m = re.search(r'(-?[\d\s\xa0]+,\d{2})\s*(EUR|PLN|USD)', s)
+    if not m:
+        return 0.0, 'EUR'
+    try:
+        val = float(m.group(1).replace('\xa0', '').replace(' ', '').replace(',', '.'))
+        return val, m.group(2)
+    except Exception:
+        return 0.0, 'EUR'
 
 
 def parse_pko_pdf(pdf_bytes: bytes) -> tuple[list[PKOTransaction], dict]:
-    """
-    Parse PKO Bank Polski PDF statement.
-    Returns (transactions, metadata).
-    Requires pdfplumber installed.
-    """
-    try:
-        import pdfplumber
-        import io
-    except ImportError:
-        raise ImportError("pdfplumber not installed. Run: pip install pdfplumber")
-
     transactions = []
     metadata = {}
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        full_text = ""
+        all_lines = []
         for page in pdf.pages:
-            full_text += page.extract_text() or ""
-            full_text += "\n"
+            text = page.extract_text() or ''
+            all_lines.extend(text.split('\n'))
 
-    # Detect currency from account name
-    if "RACHUNEK EUR" in full_text:
-        currency = "EUR"
-    else:
-        currency = "PLN"
-    metadata["currency"] = currency
+    # Metadata
+    for line in all_lines:
+        if 'RACHUNEK EUR' in line:
+            metadata['currency'] = 'EUR'
+        elif 'BIZNES PARTNER' in line:
+            metadata['currency'] = 'PLN'
+        m = re.search(r'from:\s*(\d{4}-\d{2}-\d{2})', line)
+        if m:
+            metadata['date_from'] = m.group(1)
+        m = re.search(r'to:\s*(\d{4}-\d{2}-\d{2})', line)
+        if m:
+            metadata['date_to'] = m.group(1)
 
-    # Extract account number
-    acc_m = re.search(r'Account:\s*([A-Z\s\d]+(?:\d{2}\s*\d{4}\s*\d{4}\s*\d{4}\s*\d{4}\s*\d{4}\s*\d{4}))', full_text)
-    if acc_m:
-        metadata["account"] = acc_m.group(1).strip()
+    currency = metadata.get('currency', 'EUR')
 
-    # Extract company name
-    comp_m = re.search(r'Company name:\s*(.+)', full_text)
-    if comp_m:
-        metadata["company"] = comp_m.group(1).strip()
+    DATE_RE = re.compile(r'^(\d{4}-\d{2}-\d{2})\s+(.+)$')
+    OP_TYPES = ['Commission', 'Foreign transfer', 'Transfer from account',
+                'Crediting', 'Debit', 'VAT transfer to Tax Office',
+                'Transfer to Social Security Institution']
 
-    # Extract date range
-    dates = re.findall(r'Operation date - (?:from|to):\s*(\d{4}-\d{2}-\d{2})', full_text)
-    if len(dates) >= 2:
-        metadata["date_from"] = dates[0]
-        metadata["date_to"] = dates[1]
+    dated_lines = []
+    for line in all_lines:
+        m = DATE_RE.match(line.strip())
+        if m:
+            dated_lines.append((m.group(1), m.group(2)))
 
-    # Parse transaction blocks
-    # Each transaction starts with a date pair YYYY-MM-DD
-    lines = full_text.split("\n")
+    for date, data in dated_lines:
+        # Find operation type
+        op_type = ''
+        for op in OP_TYPES:
+            if op in data:
+                op_type = op
+                break
+        if not op_type:
+            continue
 
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
+        amount, cur = _parse_amount(data)
+        if amount == 0.0:
+            continue
 
-        # Transaction date line: two identical dates on consecutive lines
-        date_m = re.match(r'^(\d{4}-\d{2}-\d{2})$', line)
-        if date_m:
-            date = date_m.group(1)
-            # Next line should also be a date (value date)
-            if i + 1 < len(lines) and re.match(r'^\d{4}-\d{2}-\d{2}$', lines[i + 1].strip()):
-                value_date = lines[i + 1].strip()
-                # Collect block until next date pair
-                block_lines = []
-                j = i + 2
-                while j < len(lines):
-                    next_line = lines[j].strip()
-                    if re.match(r'^\d{4}-\d{2}-\d{2}$', next_line):
-                        break
-                    if "Electronic document" in next_line or "Page " in next_line:
-                        j += 1
-                        continue
-                    if next_line:
-                        block_lines.append(next_line)
-                    j += 1
+        # Skip PLN commission description lines (e.g. "Commission: 61,10 PLN")
+        # Real EUR commissions are negative small amounts like -14.38 EUR
+        if op_type == 'Commission' and cur == 'PLN' and amount > 0:
+            continue
 
-                tx = _parse_pko_block(date, value_date, block_lines, currency)
-                if tx:
-                    transactions.append(tx)
-                i = j
-                continue
-        i += 1
+        # Counterparty name
+        cp_name = ''
+        cpn_m = re.search(r'Counterparty name and address:\s*(.+?)(?=Title:|Transaction identifier|Commission:|$)', data)
+        if cpn_m:
+            cp_name = re.sub(r'\s+', ' ', cpn_m.group(1)).strip()
+
+        # Title
+        title = ''
+        title_m = re.search(r'Title:\s*(.+?)(?=Transaction identifier|Commission:|Own references|$)', data)
+        if title_m:
+            title = re.sub(r'\s+', ' ', title_m.group(1)).strip()
+
+        # Counterparty account
+        cp_acc = ''
+        cpa_m = re.search(r'Counterparty account:\s*([\w\s]+?)(?=Counterparty name|Title:|$)', data)
+        if cpa_m:
+            cp_acc = cpa_m.group(1).strip()
+
+        # Transaction ID
+        tx_id = ''
+        txid_m = re.search(r'Transaction identifier:\s*(\d+)', data)
+        if txid_m:
+            tx_id = txid_m.group(1)
+
+        transactions.append(PKOTransaction(
+            date=date,
+            op_type=op_type,
+            counterparty_account=cp_acc[:80],
+            counterparty_name=cp_name[:150],
+            title=title[:200],
+            tx_id=tx_id,
+            amount=amount,
+            currency=cur,
+        ))
 
     return transactions, metadata
-
-
-def _parse_pko_block(date: str, value_date: str, lines: list[str], currency: str) -> PKOTransaction | None:
-    """Parse a single transaction block."""
-    full_text = " ".join(lines)
-
-    # Extract amount — last monetary value in the block
-    # Pattern: number with spaces/commas like "4 225,60 PLN" or "-528,90 PLN"
-    amounts = re.findall(r'(-?[\d\s]+,\d{2})\s*(PLN|EUR)', full_text)
-    if not amounts:
-        return None
-
-    # First amount = transaction amount, second = balance
-    try:
-        tx_amount_str = amounts[0][0].replace(" ", "").replace(",", ".")
-        amount = float(tx_amount_str)
-        cur = amounts[0][1]
-    except Exception:
-        return None
-
-    # Operation type
-    op_type = ""
-    for ot in ["Crediting", "Transfer from account", "Foreign transfer",
-               "Commission", "VAT transfer to Tax Office",
-               "Transfer to Social Security Institution", "Debit"]:
-        if ot in full_text:
-            op_type = ot
-            break
-
-    # Counterparty account
-    cp_acc = ""
-    cp_m = re.search(r'Counterparty account:\s*([\d\s]+)', full_text)
-    if cp_m:
-        cp_acc = cp_m.group(1).strip()
-
-    # Counterparty name
-    cp_name = ""
-    cpn_m = re.search(r'Counterparty name[^:]*:\s*(.+?)(?=Title:|Transaction|$)', full_text, re.DOTALL)
-    if cpn_m:
-        cp_name = re.sub(r'\s+', ' ', cpn_m.group(1)).strip()[:150]
-
-    # Title / description
-    title = ""
-    title_m = re.search(r'Title:\s*(.+?)(?=Transaction|Commission|Own references|$)', full_text, re.DOTALL)
-    if title_m:
-        title = re.sub(r'\s+', ' ', title_m.group(1)).strip()[:200]
-
-    # Transaction ID
-    tx_id = ""
-    txid_m = re.search(r'Transaction identifier:\s*(\d+)', full_text)
-    if txid_m:
-        tx_id = txid_m.group(1)
-
-    return PKOTransaction(
-        date=date,
-        value_date=value_date,
-        op_type=op_type,
-        counterparty_account=cp_acc,
-        counterparty_name=cp_name,
-        title=title,
-        tx_id=tx_id,
-        amount=amount,
-        currency=cur,
-    )
