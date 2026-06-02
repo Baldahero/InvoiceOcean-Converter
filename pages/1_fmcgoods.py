@@ -361,19 +361,24 @@ edited=st.data_editor(st.session_state.fmc_df[display_cols],column_config=col_cf
     use_container_width=True,num_rows="dynamic",hide_index=True,key="fmc_editor")
 
 changed=False
-for idx in range(len(edited)):
-    if idx>=len(st.session_state.fmc_df): changed=True; break
-    buyer_new=edited.at[idx,"Buyer"]; buyer_old=st.session_state.fmc_df.at[idx,"Buyer"]
-    if buyer_new!=buyer_old and buyer_new in CLIENTS:
-        c=CLIENTS[buyer_new]
-        for col,key in [("VAT ID","vat_id"),("Street","street"),("Postcode","postcode"),
-                        ("City","city"),("Country","country"),("Client e-mail","email"),("Client's phone","phone")]:
-            edited.at[idx,col]=c.get(key,"")
-        changed=True
+old_df=st.session_state.fmc_df.reset_index(drop=True)
+edited=edited.reset_index(drop=True)
+for idx in edited.index:
+    try:
+        buyer_new=str(edited.at[idx,"Buyer"] or "")
+        buyer_old=str(old_df.at[idx,"Buyer"] if idx in old_df.index else "")
+        if buyer_new!=buyer_old and buyer_new in CLIENTS:
+            c=CLIENTS[buyer_new]
+            for col,key in [("VAT ID","vat_id"),("Street","street"),("Postcode","postcode"),
+                            ("City","city"),("Country","country"),("Client e-mail","email"),("Client's phone","phone")]:
+                edited.at[idx,col]=c.get(key,"")
+            changed=True
+    except (KeyError, IndexError):
+        pass
 
 merged=edited.copy()
-if "_source" in st.session_state.fmc_df.columns:
-    src_vals=st.session_state.fmc_df["_source"].values
+if "_source" in old_df.columns:
+    src_vals=old_df["_source"].values
     merged["_source"]=list(src_vals[:len(merged)])+[""]*(max(0,len(merged)-len(src_vals)))
 
 if changed:
