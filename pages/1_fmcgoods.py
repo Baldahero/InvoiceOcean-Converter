@@ -1,434 +1,361 @@
-import csv
-import io
-import os
-import re
-import sys
-from datetime import datetime, timedelta
-
-import pandas as pd
 import streamlit as st
-
+import pandas as pd
+from datetime import datetime, timedelta
+import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from parsers.zepter_pdf_parser import parse_zepter_pdf_auto
+from parsers.pko_wyciag_parser import parse_pko_wyciag
 from parsers.zepter_parser import parse_zepter_rtf
-from utils import clients as client_utils
+from utils.clients import CLIENTS, SELLERS
 
-try:
-    from utils.learning import find_learning_match, learning_examples_count, remember_learning_rows
-except ImportError:
-    def find_learning_match(*args, **kwargs):
-        return {}
+st.set_page_config(page_title="FMCGOODS OÜ", page_icon="🇪🇪", layout="wide")
+st.title("🇪🇪 FMCGOODS OÜ → InvoiceOcean")
 
-    def learning_examples_count():
-        return 0
+with st.sidebar:
+    st.header("⚙️ Настройки")
+    due_days     = st.number_input("Срок оплаты (дней)", min_value=0, max_value=90, value=7)
+    invoice_kind = st.selectbox("Вид документа", ["Invoice", "Proforma Invoice", "Receipt"])
+    filter_type  = st.selectbox("Показать", ["Все", "Только поступления (+)", "Только списания (-)"])
+    skip_comm    = st.checkbox("Скрыть комиссии банка", value=True)
+    skip_conv    = st.checkbox("Скрыть конверсию валют", value=True)
+    skip_fx      = st.checkbox("Скрыть FX-операции", value=True)
+    skip_loans   = st.checkbox("Скрыть займы (LOAN)", value=False)
 
-    def remember_learning_rows(*args, **kwargs):
-        return 0
+st.info("📂 Поддерживаемые форматы:\n"
+        "- **Цептер Банк**: PDF (EUR/RUB) или RTF\n"
+        "- **PKO Bank Polski**: PDF (WYCIĄG — польская выписка)")
 
+uploaded = st.file_uploader(
+    "Загрузите выписки (PDF или RTF)",
+    type=["pdf", "rtf", "txt"],
+    accept_multiple_files=True,
+)
+if not uploaded:
+    st.stop()
 
-FMC_NAME = "FMCGOODS OÜ"
-CLIENTS = client_utils.CLIENTS
-SELLERS = client_utils.SELLERS
-find_best_client_match = client_utils.find_best_client_match
-load_clients_from_export = client_utils.load_clients_from_export
-merge_clients = client_utils.merge_clients
+# ── Parse all files ────────────────────────────────────────────────────────────
+class UnifiedTx:
+    def __init__(self, date, doc_num, amount, currency, counterparty,
+                 description, is_commission, is_conversion, is_fx, source):
+        self.date          = date
+        self.doc_num       = doc_num
+        self.amount        = amount
+        self.currency      = currency
+        self.counterparty  = counterparty
+        self.description   = description
+        self.is_commission = is_commission
+        self.is_conversion = is_conversion
+        self.is_fx         = is_fx
+        self.source        = source   # "Zepter EUR", "Zepter RUB", "PKO EUR", etc.
 
-FMC_PROFILE = SELLERS.get("FMCGOODS OÜ") or SELLERS.get("FMCGOODS OU") or {
-    "name": FMC_NAME,
-    "tax_id": "EE102627019",
-    "currency_default": "EUR",
-}
-
-INCOME_HEADERS = [
-    "No.", "No.", "Kind", "Seller", "Department short name",
-    "Seller's TAX ID", "Status", "Issue date", "Sale date", "Due date",
-    "Buyer", "VAT ID", "Street", "Postcode", "City", "Country",
-    "Client e-mail", "Client's phone", "Mobile phone",
-    "Total net price", "TAX", "Total gross price",
-    "Total net price EUR", "TAX EUR", "Total gross price EUR",
-    "Payment type", "Payment date", "Paid", "Currency",
-    "PO number", "Addressee", "Category", "Notes",
-    "Additional invoice field ", "Original document", "Reason for the correction",
-    "Product / Service", "Qty", "Unit net price", "Unit gross price", "TAX",
-    "VAT amount", "Total net", "Total gross",
-    "Position kind", "Quantity unit", "Additional information field",
-]
-
-EXPENSE_HEADERS = [
-    "No.", "No.", "Kind", "Buyer", "Department short name",
-    "Buyer's TAX ID", "Status", "Issue date", "Sale date", "Due date",
-    "Seller", "VAT ID", "Street", "Postcode", "City", "Country",
-    "Client e-mail", "Client's phone", "Mobile phone",
-    "Total net price", "TAX", "Total gross price",
-    "Total net price EUR", "TAX EUR", "Total gross price EUR",
-    "Payment type", "Payment date", "Paid", "Currency",
-    "PO number", "Addressee", "Category", "Notes",
-    "Additional invoice field ", "Original document", "Reason for the correction",
-    "Product / Service", "Qty", "Unit net price", "Unit gross price", "TAX",
-    "VAT amount", "Total net", "Total gross",
-    "Position kind", "Quantity unit", "Additional information field",
-]
-
-
-def build_csv_bytes(rows, headers):
-    output = io.StringIO()
-    writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
-    writer.writerow(headers)
-    for row in rows:
-        writer.writerow(row)
-    return ("\ufeff" + output.getvalue()).encode("utf-8")
-
-
-def make_due(date_value, days):
+all_txs = []
+for f in uploaded:
+    raw = f.read()
+    name = f.name.lower()
     try:
-        return (datetime.strptime(date_value, "%Y-%m-%d") + timedelta(days=days)).strftime("%Y-%m-%d")
-    except ValueError:
-        return date_value
+        if name.endswith('.rtf') or name.endswith('.txt'):
+            txs, meta = parse_zepter_rtf(raw)
+            cur = meta.get('currency', 'EUR')
+            src = f"Zepter {cur} (RTF)"
+            for t in txs:
+                all_txs.append(UnifiedTx(
+                    t.date, t.doc_num, t.amount, t.currency,
+                    t.counterparty, t.description,
+                    t.is_commission, t.is_conversion, False, src
+                ))
+        elif name.endswith('.pdf'):
+            # Detect bank by content
+            import pdfplumber, io
+            with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                first = pdf.pages[0].extract_text() or ''
 
+            if 'ЦЕПТЕР БАНК' in first or 'ZEPTBY2X' in first:
+                txs, meta = parse_zepter_pdf_auto(raw)
+                cur = meta.get('currency', 'EUR')
+                src = f"Zepter {cur} (PDF)"
+                for t in txs:
+                    all_txs.append(UnifiedTx(
+                        t.date, t.doc_num, t.amount, t.currency,
+                        t.counterparty, t.description,
+                        t.is_commission, t.is_conversion, False, src
+                    ))
+            elif 'WYCIĄG' in first or 'PKO' in first or 'Waluta rachunku' in first:
+                txs, meta = parse_pko_wyciag(raw)
+                cur = meta.get('currency', 'EUR')
+                src = f"PKO {cur} (PDF)"
+                for t in txs:
+                    all_txs.append(UnifiedTx(
+                        t.date, t.tx_id, t.amount, t.currency,
+                        t.beneficiary, t.title,
+                        t.is_commission, False, t.is_fx, src
+                    ))
+            else:
+                st.warning(f"⚠️ {f.name}: не удалось определить банк")
+                continue
 
-def parse_slash_date(date_text):
+        real = [t for t in all_txs if t.source == src]
+        st.success(f"✅ {f.name} → **{src}**: {len(txs)} операций · {meta.get('date_from','')} – {meta.get('date_to','')}")
+    except Exception as e:
+        st.error(f"❌ {f.name}: {e}")
+        import traceback; st.code(traceback.format_exc())
+
+if not all_txs:
+    st.warning("Транзакции не найдены.")
+    st.stop()
+
+# ── Filter ─────────────────────────────────────────────────────────────────────
+txs = all_txs
+if skip_comm:  txs = [t for t in txs if not t.is_commission]
+if skip_conv:  txs = [t for t in txs if not t.is_conversion]
+if skip_fx:    txs = [t for t in txs if not t.is_fx]
+if skip_loans: txs = [t for t in txs if 'LOAN' not in (t.description or '').upper()]
+if filter_type == "Только поступления (+)": txs = [t for t in txs if t.amount > 0]
+elif filter_type == "Только списания (-)":  txs = [t for t in txs if t.amount < 0]
+
+if not txs:
+    st.warning("После фильтрации нет транзакций.")
+    st.stop()
+
+# ── Build table ────────────────────────────────────────────────────────────────
+def find_client(name: str) -> str:
+    nl = (name or '').lower()
+    for cname in CLIENTS:
+        words = [w for w in cname.lower().split() if len(w) > 3]
+        if any(w in nl for w in words[:3]):
+            return cname
+    return ""
+
+def make_due(issue: str, days: int) -> str:
     try:
-        return datetime.strptime(date_text, "%d/%m/%Y").strftime("%Y-%m-%d")
-    except ValueError:
+        return (datetime.strptime(issue, "%Y-%m-%d") + timedelta(days=days)).strftime("%Y-%m-%d")
+    except:
         return ""
 
+seller      = SELLERS["FMCGOODS OÜ"]
+client_list = [""] + list(CLIENTS.keys())
 
-def normalize_invoice_ref(value):
-    cleaned = re.sub(r"\s+", " ", str(value or "")).strip(" ,.;:")
-    cleaned = re.sub(r"\s+/\s+", "/", cleaned)
-    return cleaned
+def build_rows(txs, kind, days):
+    rows = []
+    for i, t in enumerate(txs, 1):
+        buyer  = find_client(t.counterparty)
+        client = CLIENTS.get(buyer, {})
+        amt    = abs(t.amount)
+        amt_eur = amt if t.currency == "EUR" else 0.0
+        rows.append({
+            "No.":                       i,
+            "No. (invoice)":             t.doc_num or f"FMC-{t.date.replace('-','')}-{i:03d}",
+            "Kind":                      kind,
+            "Seller":                    seller["name"],
+            "Department short name":     seller["name"],
+            "Seller's TAX ID":           seller["tax_id"],
+            "Status":                    "Paid" if t.amount > 0 else "Issued",
+            "Issue date":                t.date,
+            "Sale date":                 "",
+            "Due date":                  make_due(t.date, days),
+            "Buyer":                     buyer,
+            "VAT ID":                    client.get("vat_id", ""),
+            "Street":                    client.get("street", ""),
+            "Postcode":                  client.get("postcode", ""),
+            "City":                      client.get("city", ""),
+            "Country":                   client.get("country", ""),
+            "Client e-mail":             client.get("email", ""),
+            "Client's phone":            client.get("phone", ""),
+            "Mobile phone":              "",
+            "Total net price":           amt,
+            "TAX":                       0.0,
+            "Total gross price":         amt,
+            "Total net price EUR":       amt_eur,
+            "TAX EUR":                   0.0,
+            "Total gross price EUR":     amt_eur,
+            "Payment type":              "Transfer",
+            "Payment date":              t.date if t.amount > 0 else "",
+            "Paid":                      amt if t.amount > 0 else 0.0,
+            "Currency":                  t.currency,
+            "PO number":                 t.doc_num or "",
+            "Addressee":                 "",
+            "Category":                  "",
+            "Notes":                     "",
+            "Additional invoice field":  "",
+            "Original document":         "",
+            "Reason for the correction": "",
+            "Product / Service":         (t.description or "")[:200],
+            "Qty":                       1.0,
+            "Unit net price":            amt,
+            "Unit gross price":          amt,
+            "TAX (position)":            "disabled",
+            "VAT amount":                0.0,
+            "Total net":                 amt,
+            "Total gross":               amt,
+            "Position kind":             "",
+            "Quantity unit":             "pc",
+            "Additional information":    "",
+            "_source":                   t.source,
+        })
+    return rows
 
+if "fmc_df" not in st.session_state or st.button("🔃 Перезагрузить из выписок", key="reload_fmc"):
+    st.session_state.fmc_df = pd.DataFrame(build_rows(txs, invoice_kind, due_days))
 
-def extract_invoice_ref(description, fallback_value):
-    upper = description.upper()
-    kind = "Proforma Invoice" if "PROFORMA INVOICE" in upper else "Invoice"
+# ── Stats ──────────────────────────────────────────────────────────────────────
+st.subheader(f"📊 {len(txs)} операций")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Поступления",  f"+{sum(t.amount for t in txs if t.amount>0):,.2f}")
+c2.metric("Списания",     f"{sum(t.amount for t in txs if t.amount<0):,.2f}")
+c3.metric("Записей",      len(txs))
+sources = list({t.source for t in txs})
+c4.metric("Источников",   len(sources))
+if sources:
+    st.caption("Источники: " + " · ".join(sources))
 
-    match = re.search(
-        r"(?:PROFORMA\s+INVOICE|INVOICE)\s*(?:NO\.?|:)\s*([^()]+?)(?:\(|CN code|$)",
-        description,
-        re.IGNORECASE,
-    )
-    invoice_ref = normalize_invoice_ref(match.group(1)) if match else fallback_value
+# ── Editable table ─────────────────────────────────────────────────────────────
+st.subheader("✏️ Редактирование")
+st.caption("Выберите **Покупателя ▼** — адрес и VAT заполнятся автоматически.")
 
-    issue_match = re.search(r"\bDD\s*(\d{2}/\d{2}/\d{4})\b", invoice_ref, re.IGNORECASE)
-    if not issue_match:
-        issue_match = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", invoice_ref)
+display_cols = [c for c in st.session_state.fmc_df.columns if c != "_source"]
 
-    issue_date = parse_slash_date(issue_match.group(1)) if issue_match else ""
-    return invoice_ref or fallback_value, issue_date, kind
+col_cfg = {
+    "No.":               st.column_config.NumberColumn("№", width="small", disabled=True),
+    "No. (invoice)":     st.column_config.TextColumn("Номер счёта", width="medium"),
+    "Kind":              st.column_config.SelectboxColumn("Вид", options=["Invoice","Proforma Invoice","Receipt"], width="small"),
+    "Seller":            st.column_config.TextColumn("Продавец", width="medium"),
+    "Department short name": st.column_config.TextColumn("Отдел", width="small"),
+    "Seller's TAX ID":   st.column_config.TextColumn("TAX ID", width="small"),
+    "Status":            st.column_config.SelectboxColumn("Статус", options=["Paid","Partially paid","Issued","Rejected"], width="small"),
+    "Issue date":        st.column_config.TextColumn("Дата", width="small"),
+    "Sale date":         st.column_config.TextColumn("Дата продажи", width="small"),
+    "Due date":          st.column_config.TextColumn("Срок оплаты", width="small"),
+    "Buyer":             st.column_config.SelectboxColumn("Покупатель ▼", options=client_list, width="large"),
+    "VAT ID":            st.column_config.TextColumn("VAT ID", width="medium"),
+    "Street":            st.column_config.TextColumn("Улица", width="medium"),
+    "Postcode":          st.column_config.TextColumn("Индекс", width="small"),
+    "City":              st.column_config.TextColumn("Город", width="small"),
+    "Country":           st.column_config.TextColumn("Страна", width="small"),
+    "Client e-mail":     st.column_config.TextColumn("Email", width="medium"),
+    "Client's phone":    st.column_config.TextColumn("Телефон", width="small"),
+    "Total net price":   st.column_config.NumberColumn("Нетто",    format="%.2f", width="medium"),
+    "TAX":               st.column_config.NumberColumn("НДС",      format="%.2f", width="small"),
+    "Total gross price": st.column_config.NumberColumn("Брутто",   format="%.2f", width="medium"),
+    "Total net price EUR":   st.column_config.NumberColumn("Нетто EUR",  format="%.2f", width="medium"),
+    "TAX EUR":               st.column_config.NumberColumn("НДС EUR",    format="%.2f", width="small"),
+    "Total gross price EUR": st.column_config.NumberColumn("Брутто EUR", format="%.2f", width="medium"),
+    "Payment type":      st.column_config.SelectboxColumn("Оплата", options=["Transfer","Cash","Card"], width="small"),
+    "Payment date":      st.column_config.TextColumn("Дата оплаты", width="small"),
+    "Paid":              st.column_config.NumberColumn("Оплачено",   format="%.2f", width="medium"),
+    "Currency":          st.column_config.SelectboxColumn("Валюта", options=["EUR","RUB","PLN","USD"], width="small"),
+    "PO number":         st.column_config.TextColumn("PO", width="medium"),
+    "Product / Service": st.column_config.TextColumn("Товар / Услуга", width="large"),
+    "Qty":               st.column_config.NumberColumn("Кол-во", format="%.2f", width="small"),
+    "Unit net price":    st.column_config.NumberColumn("Цена нетто",  format="%.2f", width="medium"),
+    "Unit gross price":  st.column_config.NumberColumn("Цена брутто", format="%.2f", width="medium"),
+    "TAX (position)":    st.column_config.TextColumn("НДС поз.", width="small"),
+    "VAT amount":        st.column_config.NumberColumn("Сумма НДС", format="%.2f", width="small"),
+    "Total net":         st.column_config.NumberColumn("Итого нетто",  format="%.2f", width="medium"),
+    "Total gross":       st.column_config.NumberColumn("Итого брутто", format="%.2f", width="medium"),
+    "Quantity unit":     st.column_config.SelectboxColumn("Ед. изм.", options=["cases","pc","kg","l","pcs"], width="small"),
+    "Additional information": st.column_config.TextColumn("Доп. инфо", width="medium"),
+}
 
-
-def detect_document_side(transaction):
-    role = getattr(transaction, "counterparty_role", "")
-    description = getattr(transaction, "description", "")
-    if role == "beneficiary" or "Бенефициар:" in description:
-        return "Expenses"
-    if role == "payer" or "Плательщик:" in description:
-        return "Income"
-    return "Expenses" if transaction.amount < 0 else "Income"
-
-
-st.set_page_config(page_title=FMC_NAME, page_icon="EE", layout="wide")
-st.title("EE FMCGOODS OÜ -> Zepter Bank -> InvoiceOcean")
-
-with st.sidebar:
-    st.header("Settings")
-    filter_type = st.selectbox("Transaction type", ["All", "Incoming only (+)", "Outgoing only (-)"])
-    due_days = st.number_input("Due days", min_value=0, max_value=90, value=7)
-    default_kind = st.selectbox("Default document kind", ["Invoice", "Proforma Invoice", "Receipt"])
-    skip_commissions = st.checkbox("Skip bank commissions", value=True)
-    skip_internal = st.checkbox("Skip internal conversion", value=True)
-    clients_file = st.file_uploader("InvoiceOcean clients export", type=["xls", "xlsx", "csv"])
-
-clients = CLIENTS
-if clients_file is not None:
-    try:
-        uploaded_clients = load_clients_from_export(clients_file.read(), clients_file.name)
-        clients = merge_clients(CLIENTS, uploaded_clients)
-        st.sidebar.success("Loaded {0} clients from export.".format(len(uploaded_clients)))
-    except Exception as exc:
-        st.sidebar.error("Could not read clients export: {0}".format(exc))
-
-with st.sidebar:
-    st.divider()
-    st.caption("Learning memory: {0} saved examples".format(learning_examples_count()))
-
-uploaded_files = st.file_uploader(
-    "Upload Zepter Bank RTF statements",
-    type=["rtf", "txt"],
-    accept_multiple_files=True,
-    help="Files like Выписка_*.rtf",
-)
-
-if not uploaded_files:
-    st.info("Upload one or more Zepter Bank RTF files to continue.")
-    st.stop()
-
-all_transactions = []
-for uploaded_file in uploaded_files:
-    raw_bytes = uploaded_file.read()
-    try:
-        transactions, metadata = parse_zepter_rtf(raw_bytes)
-        all_transactions.extend(transactions)
-        st.success(
-            "Loaded {0}: {1} transactions, {2} {3} -> {4}".format(
-                uploaded_file.name,
-                len(transactions),
-                metadata.get("currency", "?"),
-                metadata.get("date_from", "?"),
-                metadata.get("date_to", "?"),
-            )
-        )
-    except Exception as exc:
-        st.error("{0}: {1}".format(uploaded_file.name, exc))
-
-if not all_transactions:
-    st.warning("No transactions were parsed.")
-    st.stop()
-
-transactions = all_transactions
-if skip_commissions:
-    transactions = [transaction for transaction in transactions if not transaction.is_commission]
-if skip_internal:
-    transactions = [transaction for transaction in transactions if not transaction.is_conversion]
-if filter_type == "Incoming only (+)":
-    transactions = [transaction for transaction in transactions if transaction.amount > 0]
-elif filter_type == "Outgoing only (-)":
-    transactions = [transaction for transaction in transactions if transaction.amount < 0]
-
-if not transactions:
-    st.warning("No transactions left after filtering.")
-    st.stop()
-
-st.subheader("Parsed transactions: {0}".format(len(transactions)))
-col1, col2, col3 = st.columns(3)
-col1.metric("Incoming", "+{0:,.2f}".format(sum(tx.amount for tx in transactions if tx.amount > 0)))
-col2.metric("Outgoing", "{0:,.2f}".format(sum(tx.amount for tx in transactions if tx.amount < 0)))
-col3.metric("Rows", len(transactions))
-
-rows = []
-for row_index, transaction in enumerate(transactions, start=1):
-    matched_party = find_best_client_match(transaction.counterparty, clients, transaction.counterparty_tax_id)
-    partner_name = matched_party or transaction.counterparty
-    partner_client = clients.get(matched_party, {})
-
-    fallback_number = transaction.doc_num or "ZEPT-{0}-{1:03d}".format(transaction.date.replace("-", ""), row_index)
-    invoice_ref, extracted_issue_date, detected_kind = extract_invoice_ref(transaction.description, fallback_number)
-    document_side = detect_document_side(transaction)
-
-    issue_date = extracted_issue_date or transaction.date
-    due_date = transaction.date if detected_kind == "Proforma Invoice" else make_due(issue_date, due_days)
-    amount = abs(transaction.amount)
-    amount_eur = amount if transaction.currency == "EUR" else 0.0
-
-    if document_side == "Expenses":
-        buyer_name = FMC_PROFILE["name"]
-        seller_name = partner_name
-    else:
-        buyer_name = partner_name
-        seller_name = FMC_PROFILE["name"]
-
-    row = {
-        "No.": row_index,
-        "Document side": document_side,
-        "No. (invoice)": invoice_ref,
-        "Kind": detected_kind or default_kind,
-        "Status": "Paid",
-        "Issue date": issue_date,
-        "Sale date": "",
-        "Due date": due_date,
-        "Buyer": buyer_name,
-        "Seller": seller_name,
-        "VAT ID": partner_client.get("vat_id", ""),
-        "Street": partner_client.get("street", ""),
-        "Postcode": partner_client.get("postcode", ""),
-        "City": partner_client.get("city", ""),
-        "Country": partner_client.get("country", ""),
-        "Client e-mail": partner_client.get("email", ""),
-        "Client's phone": partner_client.get("phone", ""),
-        "Mobile phone": "",
-        "Total net price": amount,
-        "TAX": 0.0,
-        "Total gross price": amount,
-        "Total net price EUR": amount_eur,
-        "TAX EUR": 0.0,
-        "Total gross price EUR": amount_eur,
-        "Payment type": "Transfer",
-        "Payment date": transaction.date,
-        "Paid": amount,
-        "Currency": transaction.currency,
-        "PO number": invoice_ref,
-        "Product / Service": transaction.description[:200],
-        "Qty": 1.0,
-        "Quantity unit": "pc",
-        "Source bank doc": transaction.doc_num,
-        "Source counterparty": transaction.counterparty,
-        "Source tax ID": transaction.counterparty_tax_id,
-        "Source description": transaction.description,
-    }
-
-    learned = find_learning_match(FMC_NAME, transaction.counterparty, transaction.counterparty_tax_id, transaction.description)
-    if learned:
-        for key, value in learned.items():
-            if value not in (None, ""):
-                row[key] = value
-
-    rows.append(row)
-
-frame = pd.DataFrame(rows)
-
-st.subheader("Edit rows before export")
-st.caption("You can change document side, invoice number, buyer, seller, dates, and delete rows directly in the table.")
-
-edited_frame = st.data_editor(
-    frame,
+edited = st.data_editor(
+    st.session_state.fmc_df[display_cols],
+    column_config=col_cfg,
     use_container_width=True,
     num_rows="dynamic",
     hide_index=True,
-    column_config={
-        "Document side": st.column_config.SelectboxColumn("Document side", options=["Income", "Expenses"]),
-        "Buyer": st.column_config.TextColumn("Buyer"),
-        "Seller": st.column_config.TextColumn("Seller"),
-        "Kind": st.column_config.SelectboxColumn("Kind", options=["Invoice", "Proforma Invoice", "Receipt"]),
-        "Status": st.column_config.SelectboxColumn("Status", options=["Paid", "Partially paid", "Issued", "Rejected"]),
-        "Currency": st.column_config.SelectboxColumn("Currency", options=["EUR", "RUB", "USD", "BYN"]),
-        "Payment type": st.column_config.SelectboxColumn("Payment type", options=["Transfer", "Cash", "Card"]),
-        "Quantity unit": st.column_config.SelectboxColumn("Quantity unit", options=["pc", "pcs", "case", "kg", "l"]),
-    },
+    key="fmc_editor",
 )
 
-st.subheader("Export CSV for InvoiceOcean")
-income_rows = []
-expense_rows = []
-skipped = 0
+# Auto-fill client data
+changed = False
+for idx in range(len(edited)):
+    if idx >= len(st.session_state.fmc_df):
+        changed = True
+        break
+    buyer_new = edited.at[idx, "Buyer"]
+    buyer_old = st.session_state.fmc_df.at[idx, "Buyer"]
+    if buyer_new != buyer_old and buyer_new in CLIENTS:
+        c = CLIENTS[buyer_new]
+        for col, key in [("VAT ID","vat_id"),("Street","street"),("Postcode","postcode"),
+                         ("City","city"),("Country","country"),
+                         ("Client e-mail","email"),("Client's phone","phone")]:
+            edited.at[idx, col] = c.get(key, "")
+        changed = True
 
-for _, row in edited_frame.iterrows():
-    document_side = str(row.get("Document side", "Income")).strip() or "Income"
-    buyer_name = str(row.get("Buyer", "")).strip()
-    seller_name = str(row.get("Seller", "")).strip()
-    partner_name = buyer_name if document_side == "Income" else seller_name
+# Merge edited back with _source column
+merged = edited.copy()
+if "_source" in st.session_state.fmc_df.columns:
+    merged["_source"] = st.session_state.fmc_df["_source"].values[:len(merged)] if len(merged) <= len(st.session_state.fmc_df) else ""
 
-    if not partner_name:
-        skipped += 1
-        continue
-
-    source_tax_id = str(row.get("Source tax ID", "")).strip()
-    client_key = partner_name if partner_name in clients else find_best_client_match(partner_name, clients, source_tax_id)
-    partner_client = clients.get(client_key, {})
-    amount = float(row.get("Total gross price", 0) or 0)
-    amount_eur = float(row.get("Total gross price EUR", 0) or 0)
-    invoice_no = str(row.get("No. (invoice)", "")).strip()
-    po_number = str(row.get("PO number", "")).strip() or invoice_no
-
-    common_tail = [
-        amount,
-        float(row.get("TAX", 0) or 0),
-        amount,
-        amount_eur,
-        float(row.get("TAX EUR", 0) or 0),
-        amount_eur,
-        str(row.get("Payment type", "Transfer")),
-        str(row.get("Payment date", "")),
-        float(row.get("Paid", 0) or 0),
-        str(row.get("Currency", "EUR")),
-        po_number,
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        str(row.get("Product / Service", "")),
-        float(row.get("Qty", 1) or 1),
-        amount,
-        amount,
-        "disabled",
-        0.0,
-        amount,
-        amount,
-        "",
-        str(row.get("Quantity unit", "pc")),
-        "",
-    ]
-
-    if document_side == "Income":
-        income_rows.append([
-            len(income_rows) + 1,
-            invoice_no,
-            str(row.get("Kind", default_kind)),
-            seller_name or FMC_PROFILE["name"],
-            FMC_PROFILE["name"],
-            FMC_PROFILE["tax_id"],
-            str(row.get("Status", "Paid")),
-            str(row.get("Issue date", "")),
-            str(row.get("Sale date", "")),
-            str(row.get("Due date", "")),
-            buyer_name,
-            str(row.get("VAT ID", "") or partner_client.get("vat_id", "")),
-            str(row.get("Street", "") or partner_client.get("street", "")),
-            str(row.get("Postcode", "") or partner_client.get("postcode", "")),
-            str(row.get("City", "") or partner_client.get("city", "")),
-            str(row.get("Country", "") or partner_client.get("country", "")),
-            str(row.get("Client e-mail", "") or partner_client.get("email", "")),
-            str(row.get("Client's phone", "") or partner_client.get("phone", "")),
-            str(row.get("Mobile phone", "")),
-            *common_tail
-        ])
-    else:
-        expense_rows.append([
-            len(expense_rows) + 1,
-            invoice_no,
-            str(row.get("Kind", default_kind)),
-            buyer_name or FMC_PROFILE["name"],
-            FMC_PROFILE["name"],
-            FMC_PROFILE["tax_id"],
-            str(row.get("Status", "Paid")),
-            str(row.get("Issue date", "")),
-            str(row.get("Sale date", "")),
-            str(row.get("Due date", "")),
-            seller_name,
-            str(row.get("VAT ID", "") or partner_client.get("vat_id", "")),
-            str(row.get("Street", "") or partner_client.get("street", "")),
-            str(row.get("Postcode", "") or partner_client.get("postcode", "")),
-            str(row.get("City", "") or partner_client.get("city", "")),
-            str(row.get("Country", "") or partner_client.get("country", "")),
-            str(row.get("Client e-mail", "") or partner_client.get("email", "")),
-            str(row.get("Client's phone", "") or partner_client.get("phone", "")),
-            str(row.get("Mobile phone", "")),
-            *common_tail
-        ])
-
-if skipped:
-    st.info("Skipped {0} rows without a filled buyer/seller.".format(skipped))
-
-downloaded = False
-
-if not income_rows and not expense_rows:
-    st.warning("No rows are ready for export. Fill buyer/seller or add valid rows first.")
+if changed:
+    st.session_state.fmc_df = merged
+    st.rerun()
 else:
-    st.caption("Ready rows: Income {0} | Expenses {1}".format(len(income_rows), len(expense_rows)))
+    st.session_state.fmc_df = merged
 
-    if income_rows:
-        income_name = "InvoiceOcean_FMCGOODS_Income_{0}.csv".format(datetime.now().strftime("%Y%m%d"))
-        downloaded = st.download_button(
-            "Download Income CSV",
-            build_csv_bytes(income_rows, INCOME_HEADERS),
-            income_name,
-            "text/csv",
-            use_container_width=True,
-        ) or downloaded
+# ── Export ─────────────────────────────────────────────────────────────────────
+st.divider()
+st.subheader("📥 Экспорт")
 
-    if expense_rows:
-        expense_name = "InvoiceOcean_FMCGOODS_Expenses_{0}.csv".format(datetime.now().strftime("%Y%m%d"))
-        downloaded = st.download_button(
-            "Download Expenses CSV",
-            build_csv_bytes(expense_rows, EXPENSE_HEADERS),
-            expense_name,
-            "text/csv",
-            use_container_width=True,
-        ) or downloaded
+if st.button("🔄 Сгенерировать CSV для InvoiceOcean", type="primary", use_container_width=True):
+    final_cols = [
+        "No.", "No.", "Kind", "Seller", "Department short name",
+        "Seller's TAX ID", "Status", "Issue date", "Sale date", "Due date",
+        "Buyer", "VAT ID", "Street", "Postcode", "City", "Country",
+        "Client e-mail", "Client's phone", "Mobile phone",
+        "Total net price", "TAX", "Total gross price",
+        "Total net price EUR", "TAX EUR", "Total gross price EUR",
+        "Payment type", "Payment date", "Paid", "Currency",
+        "PO number", "Addressee", "Category", "Notes",
+        "Additional invoice field ", "Original document", "Reason for the correction",
+        "Product / Service", "Qty", "Unit net price", "Unit gross price", "TAX",
+        "VAT amount", "Total net", "Total gross",
+        "Position kind", "Quantity unit", "Additional information field",
+    ]
+    import csv, io as sio
+    out_rows = []
+    df_exp = st.session_state.fmc_df
+    for _, row in df_exp.iterrows():
+        amt     = float(row.get("Total gross price", 0) or 0)
+        amt_eur = float(row.get("Total gross price EUR", 0) or 0)
+        out_rows.append([
+            int(row.get("No.", 0)),
+            str(row.get("No. (invoice)", "")),
+            str(row.get("Kind", "Invoice")),
+            str(row.get("Seller", "")),
+            str(row.get("Department short name", "")),
+            str(row.get("Seller's TAX ID", "")),
+            str(row.get("Status", "Issued")),
+            str(row.get("Issue date", "")),
+            str(row.get("Sale date", "")),
+            str(row.get("Due date", "")),
+            str(row.get("Buyer", "")),
+            str(row.get("VAT ID", "")),
+            str(row.get("Street", "")),
+            str(row.get("Postcode", "")),
+            str(row.get("City", "")),
+            str(row.get("Country", "")),
+            str(row.get("Client e-mail", "")),
+            str(row.get("Client's phone", "")),
+            "",
+            amt, 0.0, amt, amt_eur, 0.0, amt_eur,
+            str(row.get("Payment type", "Transfer")),
+            str(row.get("Payment date", "")),
+            float(row.get("Paid", 0) or 0),
+            str(row.get("Currency", "EUR")),
+            str(row.get("PO number", "")),
+            "", "", "", "", "", "",
+            str(row.get("Product / Service", "")),
+            float(row.get("Qty", 1) or 1),
+            amt, amt, "disabled", 0.0, amt, amt,
+            "", str(row.get("Quantity unit", "pc")), "",
+        ])
+    buf = sio.StringIO()
+    w = csv.writer(buf)
+    w.writerow(final_cols)
+    w.writerows(out_rows)
+    csv_bytes = ("\ufeff" + buf.getvalue()).encode("utf-8")
+    filename = f"InvoiceOcean_FMCGOODS_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    st.download_button(f"⬇️ Скачать {filename}", csv_bytes, filename, "text/csv", use_container_width=True)
+    st.success(f"✅ {len(out_rows)} строк экспортировано.")
 
-if downloaded:
-    learned_count = remember_learning_rows(FMC_NAME, edited_frame.to_dict("records"))
-    if learned_count:
-        st.success("Learning memory updated from {0} row(s).".format(learned_count))
+st.caption("📌 InvoiceOcean: Settings → Import → New Import → выбрать CSV")
