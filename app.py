@@ -154,7 +154,7 @@ def parse_pko(pdf_bytes):
             m2 = re.search(r'Transaction identifier:\s*(\d+)', full)
             if m2: tx_id = m2.group(1)
             is_comm = op == 'Commission' or 'OPŁATY' in full
-            is_fx   = bool(re.search(r'FX\d+', title + full[:50]))
+            is_fx   = bool(re.search(r'FX\d+', title + full[:50])) and amount < 0
             is_tax  = op in ('VAT transfer to Tax Office', 'Transfer to Social Security Institution')
             if not is_comm and not is_fx:
                 txs.append({'date': date, 'amount': amount, 'currency': cur,
