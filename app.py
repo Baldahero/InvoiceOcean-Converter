@@ -423,10 +423,10 @@ col_cfg = {
 
 # Session state for the dataframe
 if 'main_df' not in st.session_state or st.button('🔃 Сбросить и перечитать файлы'):
-    st.session_state.main_df = df[display_cols].copy()
+    st.session_state.main_df = df[display_cols].reset_index(drop=True).copy()
 
 edited = st.data_editor(
-    st.session_state.main_df,
+    st.session_state.main_df.reset_index(drop=True),
     column_config=col_cfg,
     use_container_width=True,
     num_rows='dynamic',
@@ -528,7 +528,8 @@ with tab1:
                 }
                 
                 try:
-                    resp = requests.post(
+                    import requests as req_lib
+                    resp = req_lib.post(
                         f"https://{IO_DOMAIN}/invoices.json",
                         json=payload,
                         timeout=10
@@ -541,7 +542,7 @@ with tab1:
                         
                         # Send by email if requested
                         if send_email and client.get("email") and inv_id:
-                            requests.post(
+                            req_lib.post(
                                 f"https://{IO_DOMAIN}/invoices/{inv_id}/send_by_email.json?api_token={IO_TOKEN}",
                                 timeout=10
                             )
