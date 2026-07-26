@@ -519,7 +519,7 @@ with tab1:
                         "status": "paid" if float(row.get("Paid", 0) or 0) >= amt else "issued",
                         "paid": float(row.get("Paid", 0) or 0),
                         "positions": [{
-                            "name": str(row.get("Product / Service", "Payment"))[:200],
+                            "name": (str(row.get("Product / Service", "") or "").strip() or "Payment")[:200],
                             "tax": "disabled",
                             "total_price_gross": amt,
                             "quantity": 1,
