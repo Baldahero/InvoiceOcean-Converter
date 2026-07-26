@@ -481,8 +481,7 @@ with tab1:
     if st.button("🚀 Создать счета в InvoiceOcean", type="primary", use_container_width=True):
         df_send = st.session_state.main_df.copy()
         if only_positive:
-            # filter by amount sign from description or paid field
-            df_send = df_send[df_send['Paid'] > 0]
+            df_send = df_send[df_send['Total gross price'] > 0]
         
         if df_send.empty:
             st.warning("Нет строк для отправки.")
@@ -515,8 +514,8 @@ with tab1:
                         "buyer_email":   client.get("email", ""),
                         "currency": str(row.get("Currency", "EUR")),
                         "payment_type": "transfer",
-                        "status": "paid" if float(row.get("Paid", 0) or 0) >= amt else "issued",
-                        "paid": float(row.get("Paid", 0) or 0),
+                        "status": "paid" if str(row.get("Status","")) == "Paid" else "issued",
+                        "paid": amt if str(row.get("Status","")) == "Paid" else 0,
                         "positions": [{
                             "name": (str(row.get("Product / Service", "") or "").strip() or "Payment")[:200],
                             "tax": "disabled",
