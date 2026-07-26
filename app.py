@@ -464,18 +464,118 @@ else:
 st.divider()
 st.subheader('📥 Экспорт в InvoiceOcean')
 
-if st.button('🔄 Сгенерировать CSV', type='primary', use_container_width=True):
-    export_df = st.session_state.main_df.copy()
-    # sync numeric cols
-    for col in ['Total net price','Total gross price','Total net price EUR','Total gross price EUR']:
-        if col not in export_df.columns:
-            export_df[col] = export_df['Total gross price']
-    csv_bytes = build_invoiceocean_csv(export_df)
-    fname = f"InvoiceOcean_{seller_key.replace(' ','_')[:20]}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-    st.download_button(
-        f'⬇️ Скачать {fname}',
-        csv_bytes, fname, 'text/csv',
-        use_container_width=True,
-    )
-    st.success(f'✅ {len(export_df)} строк готово к загрузке в InvoiceOcean')
-    st.caption('📌 InvoiceOcean → Settings → Import → New Import → выбрать этот CSV')
+# InvoiceOcean API settings
+IO_DOMAIN = "tentatrade.invoiceocean.co.uk"
+IO_TOKEN  = "Eq27xW22rlJdVjKm81S"
+
+tab1, tab2 = st.tabs(["🚀 Отправить напрямую в InvoiceOcean", "📄 Скачать CSV"])
+
+with tab1:
+    st.info("Счета будут созданы прямо в InvoiceOcean — без CSV и без импорта!")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        send_email = st.checkbox("📧 Отправить PDF клиенту по email после создания", value=False)
+    with col2:
+        only_positive = st.checkbox("Только поступления (+ суммы)", value=True)
+
+    if st.button("🚀 Создать счета в InvoiceOcean", type="primary", use_container_width=True):
+        df_send = st.session_state.main_df.copy()
+        if only_positive:
+            # filter by amount sign from description or paid field
+            df_send = df_send[df_send['Paid'] > 0]
+        
+        if df_send.empty:
+            st.warning("Нет строк для отправки.")
+        else:
+            progress = st.progress(0)
+            results = []
+            errors  = []
+            
+            for idx, (_, row) in enumerate(df_send.iterrows()):
+                buyer = str(row.get("Buyer", "") or "")
+                client = CLIENTS.get(buyer, {})
+                amt = float(row.get("Total gross price", 0) or 0)
+                if amt == 0:
+                    continue
+                
+                payload = {
+                    "api_token": IO_TOKEN,
+                    "invoice": {
+                        "kind": "vat" if str(row.get("Kind","")) == "Invoice" else "proforma",
+                        "number": None,
+                        "issue_date": str(row.get("Issue date", "")),
+                        "sell_date":  str(row.get("Issue date", "")),
+                        "payment_to": str(row.get("Due date", "")),
+                        "buyer_name":    buyer or "Unknown",
+                        "buyer_tax_no":  client.get("vat_id", ""),
+                        "buyer_street":  client.get("street", ""),
+                        "buyer_post_code": client.get("postcode", ""),
+                        "buyer_city":    client.get("city", ""),
+                        "buyer_country": client.get("country", ""),
+                        "buyer_email":   client.get("email", ""),
+                        "currency": str(row.get("Currency", "EUR")),
+                        "payment_type": "transfer",
+                        "status": "paid" if float(row.get("Paid", 0) or 0) >= amt else "issued",
+                        "paid": float(row.get("Paid", 0) or 0),
+                        "positions": [{
+                            "name": str(row.get("Product / Service", "Payment"))[:200],
+                            "tax": "disabled",
+                            "total_price_gross": amt,
+                            "quantity": 1,
+                        }]
+                    }
+                }
+                
+                try:
+                    resp = requests.post(
+                        f"https://{IO_DOMAIN}/invoices.json",
+                        json=payload,
+                        timeout=10
+                    )
+                    if resp.status_code == 201:
+                        inv = resp.json()
+                        inv_id  = inv.get("id")
+                        inv_num = inv.get("number", "")
+                        results.append((inv_id, inv_num, buyer, amt, str(row.get("Currency",""))))
+                        
+                        # Send by email if requested
+                        if send_email and client.get("email") and inv_id:
+                            requests.post(
+                                f"https://{IO_DOMAIN}/invoices/{inv_id}/send_by_email.json?api_token={IO_TOKEN}",
+                                timeout=10
+                            )
+                    else:
+                        errors.append(f"Row {idx+1}: {resp.status_code} — {resp.text[:100]}")
+                except Exception as e:
+                    errors.append(f"Row {idx+1}: {e}")
+                
+                progress.progress((idx + 1) / len(df_send))
+            
+            progress.empty()
+            
+            if results:
+                st.success(f"✅ Создано {len(results)} счетов в InvoiceOcean!")
+                result_df = pd.DataFrame(results, columns=["ID", "Номер", "Клиент", "Сумма", "Валюта"])
+                st.dataframe(result_df, use_container_width=True, hide_index=True)
+                if send_email:
+                    st.info("📧 PDF отправлены клиентам по email")
+            if errors:
+                st.error(f"❌ Ошибки ({len(errors)}):")
+                for e in errors:
+                    st.caption(e)
+
+with tab2:
+    st.caption("Скачайте CSV и загрузите вручную через InvoiceOcean → Settings → Import")
+    if st.button("📄 Скачать CSV", use_container_width=True):
+        export_df = st.session_state.main_df.copy()
+        for col in ['Total net price','Total gross price','Total net price EUR','Total gross price EUR']:
+            if col not in export_df.columns:
+                export_df[col] = export_df.get('Total gross price', 0)
+        csv_bytes = build_invoiceocean_csv(export_df)
+        fname = f"InvoiceOcean_{seller_key.replace(' ','_')[:20]}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        st.download_button(
+            f'⬇️ Скачать {fname}',
+            csv_bytes, fname, 'text/csv',
+            use_container_width=True,
+        )
