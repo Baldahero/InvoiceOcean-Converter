@@ -304,6 +304,7 @@ for f in uploaded:
                     'PO number': t['doc'],
                     'Product / Service': t['description'][:200],
                     'Quantity unit': 'pc',
+                    'Тип': 'Income' if t['amount'] >= 0 else 'Expense',
                     '_amount_raw': t['amount'],
                     '_source': f.name,
                     '_bank': 'Zepter',
@@ -347,6 +348,7 @@ for f in uploaded:
                     'PO number': t['tx_id'],
                     'Product / Service': t['title'][:200],
                     'Quantity unit': 'pc',
+                    'Тип': 'Income' if t['amount'] >= 0 else 'Expense',
                     '_amount_raw': t['amount'],
                     '_source': f.name,
                     '_bank': 'PKO',
@@ -415,6 +417,7 @@ col_cfg = {
     'Payment date':    st.column_config.TextColumn('Дата оплаты', width='small'),
     'Paid':            st.column_config.NumberColumn('Оплачено', format='%.2f', width='medium'),
     'Currency':        st.column_config.SelectboxColumn('Валюта', options=['EUR','RUB','PLN','USD'], width='small'),
+    'Тип':             st.column_config.SelectboxColumn('Тип', options=['Income','Expense'], width='small'),
     'PO number':       st.column_config.TextColumn('Номер фактуры', width='medium'),
     'Product / Service': st.column_config.TextColumn('Описание', width='large'),
     'Quantity unit':   st.column_config.SelectboxColumn('Ед.', options=['pc','cases','kg','l'], width='small'),
@@ -481,7 +484,7 @@ with tab1:
     if st.button("🚀 Создать счета в InvoiceOcean", type="primary", use_container_width=True):
         df_send = st.session_state.main_df.copy()
         if only_positive:
-            df_send = df_send[df_send['Total gross price'] > 0]
+            df_send = df_send[df_send['Тип'] == 'Income']
         
         if df_send.empty:
             st.warning("Нет строк для отправки.")
@@ -500,7 +503,7 @@ with tab1:
                 payload = {
                     "api_token": IO_TOKEN,
                     "invoice": {
-                        "kind": "vat" if str(row.get("Kind","")) == "Invoice" else "proforma",
+                        "kind": "expense" if str(row.get("Тип","")) == "Expense" else "vat",
                         "number": None,
                         "issue_date": str(row.get("Issue date", "")),
                         "sell_date":  str(row.get("Issue date", "")),
