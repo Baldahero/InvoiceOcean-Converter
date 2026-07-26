@@ -246,8 +246,6 @@ st.title('🏦 Bank → InvoiceOcean')
 with st.sidebar:
     st.header('⚙️ Настройки')
     seller_key   = st.selectbox('Компания (продавец)', list(SELLERS.keys()))
-    due_days     = st.number_input('Срок оплаты (дней)', 0, 90, 7)
-    invoice_kind = st.selectbox('Вид документа', ['Invoice', 'Proforma Invoice', 'Receipt'])
     st.divider()
     skip_tax   = st.checkbox('Скрыть налоги / ZUS', True)
     skip_loans = st.checkbox('Скрыть займы (LOAN)', False)
@@ -281,12 +279,12 @@ for f in uploaded:
                 all_rows.append({
                     'No.': i,
                     'No. (invoice)': t['doc'] or f"Z-{t['date'].replace('-','')}-{i:03d}",
-                    'Kind': invoice_kind,
+                    'Kind': 'Invoice',
                     'Seller': seller['name'],
                     "Seller's TAX ID": seller['tax_id'],
                     'Status': 'Paid' if t['amount'] > 0 else 'Issued',
                     'Issue date': t['date'],
-                    'Due date': make_due(t['date'], due_days),
+                    'Due date': make_due(t['date'], 7),
                     'Buyer': buyer,
                     'VAT ID': client.get('vat_id', ''),
                     'Street': client.get('street', ''),
@@ -324,12 +322,12 @@ for f in uploaded:
                 all_rows.append({
                     'No.': i,
                     'No. (invoice)': t['tx_id'] or f"P-{t['date'].replace('-','')}-{i:03d}",
-                    'Kind': invoice_kind,
+                    'Kind': 'Invoice',
                     'Seller': seller['name'],
                     "Seller's TAX ID": seller['tax_id'],
                     'Status': 'Paid' if t['amount'] > 0 else 'Issued',
                     'Issue date': t['date'],
-                    'Due date': make_due(t['date'], due_days),
+                    'Due date': make_due(t['date'], 7),
                     'Buyer': buyer,
                     'VAT ID': client.get('vat_id', ''),
                     'Street': client.get('street', ''),
