@@ -33,6 +33,7 @@ CLIENTS = {
     "W.CONSULTANCY B.V.": {"vat_id": "", "street": "TUINBOUWVEILINGWEG 5 B34", "postcode": "4814RP", "city": "Breda", "country": "NL", "email": ""},
     "CHIC N BASIC 2010 SL": {"vat_id": "B65316093", "street": "AV. CASTELL DE BARBERA, 27-29", "postcode": "08210", "city": "Barcelona", "country": "ES", "email": ""},
     "SEZEN ANNA": {"vat_id": "", "street": "", "postcode": "", "city": "", "country": "ES", "email": ""},
+    "ASSTRA FORWARDING AG": {"vat_id": "CHE-115.138.470", "street": "Staubstrasse 15", "postcode": "8038", "city": "Zurich", "country": "CH", "email": "office@asstra.com"},
     "LLC UNISTORE GROUP": {"vat_id": "", "street": "SLOBODSKAYA 131", "postcode": "", "city": "Minsk", "country": "BY", "email": ""},
     "OOO GROALLS": {"vat_id": "193766800", "street": "G.MINSK, UL.TIMIRYAZEVA, DOM 67-222", "postcode": "", "city": "Minsk", "country": "BY", "email": ""},
 }
