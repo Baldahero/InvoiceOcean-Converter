@@ -428,7 +428,7 @@ edited = st.data_editor(
     st.session_state.main_df.reset_index(drop=True),
     column_config=col_cfg,
     use_container_width=True,
-    num_rows='dynamic',
+    num_rows='fixed',
     hide_index=True,
     key='main_editor',
 )
