@@ -484,7 +484,10 @@ with tab1:
     if st.button("🚀 Создать счета в InvoiceOcean", type="primary", use_container_width=True):
         df_send = st.session_state.main_df.copy()
         if only_positive:
-            df_send = df_send[df_send['Тип'] == 'Income']
+            if 'Тип' in df_send.columns:
+                df_send = df_send[df_send['Тип'] == 'Income']
+            else:
+                df_send = df_send[df_send['Total gross price'] > 0]
         
         if df_send.empty:
             st.warning("Нет строк для отправки.")
