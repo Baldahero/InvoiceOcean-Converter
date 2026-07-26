@@ -415,7 +415,7 @@ col_cfg = {
     'Payment date':    st.column_config.TextColumn('Дата оплаты', width='small'),
     'Paid':            st.column_config.NumberColumn('Оплачено', format='%.2f', width='medium'),
     'Currency':        st.column_config.SelectboxColumn('Валюта', options=['EUR','RUB','PLN','USD'], width='small'),
-    'PO number':       st.column_config.TextColumn('PO', width='medium'),
+    'PO number':       st.column_config.TextColumn('Номер фактуры', width='medium'),
     'Product / Service': st.column_config.TextColumn('Описание', width='large'),
     'Quantity unit':   st.column_config.SelectboxColumn('Ед.', options=['pc','cases','kg','l'], width='small'),
 }
